@@ -30,8 +30,9 @@ class Config:
         'bw': 'templates/ub_logo_bw.png'
     }
     UB_COLORS = {
-        'navy': ([100, 50, 50], [130, 255, 255]),     # Navy blue
-        'gold': ([15, 100, 100], [25, 255, 255])      # Gold/yellow
+        'navy': ([110, 80, 30], [125, 255, 180]),     # Navy blue (lebih ketat)
+        'gold': ([18, 120, 120], [22, 255, 255]),     # Gold/yellow (lebih spesifik)
+        'dark_blue': ([105, 100, 50], [115, 255, 150])  # Dark blue almamater
     }
     
     # Settings UI & Logika
@@ -87,6 +88,39 @@ class TemporalAveraging:
         self.buffer.clear()
 
 
+class CivitasTemporalAveraging:
+    def __init__(self, window_size=20, confidence_threshold=0.6):
+        self.window_size = window_size
+        self.confidence_threshold = confidence_threshold
+        self.buffer = deque(maxlen=window_size)
+    
+    def add_prediction(self, civitas_score, is_civitas):
+        # Simpan sebagai [score, is_civitas_binary]
+        self.buffer.append([civitas_score, 1.0 if is_civitas else 0.0])
+    
+    def get_averaged_civitas(self):
+        if len(self.buffer) < 3:
+            return "Detecting...", 0.0
+        
+        # Rata-rata score dan status
+        scores = [item[0] for item in self.buffer]
+        statuses = [item[1] for item in self.buffer]
+        
+        avg_score = np.mean(scores)
+        avg_status = np.mean(statuses)  # 0.0-1.0
+        
+        # Tentukan status berdasarkan rata-rata
+        if avg_status >= 0.6 and avg_score >= self.confidence_threshold:
+            return "Civitas UB", avg_score
+        elif avg_status >= 0.4:
+            return "Uncertain", avg_score
+        else:
+            return "Non-Civitas UB", avg_score
+    
+    def reset(self):
+        self.buffer.clear()
+
+
 # ==================== CIVITAS DETECTION ====================
 class CivitasDetector:
     def __init__(self):
@@ -102,22 +136,31 @@ class CivitasDetector:
     def detect_ub_logo(self, chest_roi):
         """Deteksi logo UB menggunakan multiple template matching dan deteksi warna"""
         if chest_roi.shape[0] < 50 or chest_roi.shape[1] < 50:
-            return False, 0.0
+            return False, 0.0, None
             
         gray_chest = cv2.cvtColor(chest_roi, cv2.COLOR_BGR2GRAY)
         hsv_chest = cv2.cvtColor(chest_roi, cv2.COLOR_BGR2HSV)
         
         logo_score = 0.0
+        logo_location = None
         
         # 1. Multiple template matching
         if self.ub_logo_templates:
             max_template_score = 0.0
+            best_location = None
+            
             for template_type, template in self.ub_logo_templates.items():
                 result = cv2.matchTemplate(gray_chest, template, cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, _ = cv2.minMaxLoc(result)
-                max_template_score = max(max_template_score, max_val)
+                _, max_val, _, max_loc = cv2.minMaxLoc(result)
+                
+                if max_val > max_template_score:
+                    max_template_score = max_val
+                    # Koordinat logo dalam chest_roi
+                    best_location = (max_loc[0], max_loc[1], template.shape[1], template.shape[0])
             
             logo_score += max_template_score * 0.6  # 60% weight untuk template matching
+            if max_template_score > 0.4:  # Threshold untuk lokasi logo
+                logo_location = best_location
         
         # 2. Deteksi kombinasi warna navy + gold (untuk logo berwarna)
         navy_lower, navy_upper = Config.UB_COLORS['navy']
@@ -142,8 +185,13 @@ class CivitasDetector:
         
         if circles is not None and len(circles[0]) > 0:
             logo_score += 0.2
+            # Jika belum ada lokasi dari template matching, gunakan circle detection
+            if logo_location is None and logo_score > 0.45:
+                circle = circles[0][0]
+                cx, cy, radius = int(circle[0]), int(circle[1]), int(circle[2])
+                logo_location = (cx - radius, cy - radius, radius * 2, radius * 2)
         
-        return logo_score > 0.3, logo_score
+        return logo_score > 0.45, logo_score, logo_location  # Threshold lebih ketat
     
     def detect_civitas_status(self, frame, x, y, w, h):
         """Deteksi status civitas berdasarkan almamater/jas + logo UB"""
@@ -171,28 +219,48 @@ class CivitasDetector:
         navy_ratio = np.sum(navy_mask > 0) / (chest_roi.shape[0] * chest_roi.shape[1])
         
         # 2. Deteksi logo UB
-        has_logo, logo_confidence = self.detect_ub_logo(chest_roi)
+        has_logo, logo_confidence, logo_location = self.detect_ub_logo(chest_roi)
         
-        # 3. Logika klasifikasi civitas
+        # 3. Deteksi warna almamater tambahan
+        dark_blue_lower, dark_blue_upper = Config.UB_COLORS['dark_blue']
+        dark_blue_mask = cv2.inRange(hsv, np.array(dark_blue_lower), np.array(dark_blue_upper))
+        dark_blue_ratio = np.sum(dark_blue_mask > 0) / (chest_roi.shape[0] * chest_roi.shape[1])
+        
+        # Gabungan semua warna formal UB
+        formal_ratio = max(navy_ratio, dark_blue_ratio)
+        
+        # 4. Logika klasifikasi civitas (DIPERBAIKI)
         civitas_score = 0.0
         
-        # Jika ada jas formal (navy) + logo UB = Civitas UB
-        if navy_ratio > 0.15 and has_logo:
-            civitas_score = 0.7 + (logo_confidence * 0.3)
+        # CIVITAS UB - Kondisi ketat
+        if formal_ratio > 0.25 and has_logo and logo_confidence > 0.6:
+            # Almamater + Logo UB dengan confidence tinggi
+            civitas_score = 0.85 + (logo_confidence * 0.15)
             status = "Civitas UB"
-        # Jika hanya ada logo UB tanpa jas formal = kemungkinan civitas
-        elif has_logo and logo_confidence > 0.5:
-            civitas_score = 0.6
+        elif formal_ratio > 0.30 and has_logo and logo_confidence > 0.4:
+            # Almamater kuat + Logo UB sedang
+            civitas_score = 0.75 + (logo_confidence * 0.15)
             status = "Civitas UB"
-        # Jika hanya jas tanpa logo = bukan civitas UB
-        elif navy_ratio > 0.20:
-            civitas_score = 0.3
+        elif has_logo and logo_confidence > 0.7:
+            # Logo UB sangat jelas tanpa almamater (kemungkinan dosen/staff)
+            civitas_score = 0.65
+            status = "Civitas UB"
+        
+        # NON-CIVITAS UB
+        elif formal_ratio > 0.35:
+            # Pakaian formal tapi tidak ada logo UB (kemungkinan jas biasa)
+            civitas_score = 0.4
+            status = "Non-Civitas UB"
+        elif formal_ratio > 0.20:
+            # Sedikit warna formal
+            civitas_score = 0.25
             status = "Non-Civitas UB"
         else:
+            # Pakaian casual
             civitas_score = 0.1
             status = "Non-Civitas UB"
         
-        return status, civitas_score, (chest_x, chest_y, chest_w, chest_h)
+        return status, civitas_score, (chest_x, chest_y, chest_w, chest_h), logo_location
 
 # ==================== MAIN LIVE SYSTEM ====================
 class LiveSystem:
@@ -228,6 +296,7 @@ class LiveSystem:
         ])
         
         self.temporal_avg = TemporalAveraging(Config.WINDOW_SIZE, Config.CONFIDENCE_THRESHOLD)
+        self.civitas_temporal_avg = CivitasTemporalAveraging(window_size=20, confidence_threshold=0.65)
         self.no_face_counter = 0
         
         # Variabel FPS
@@ -250,7 +319,8 @@ class LiveSystem:
                     cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
         return frame
 
-    def draw_dashboard(self, frame, x, y, w, h, instant_emo, instant_conf, smooth_emo, smooth_conf, civitas_info=None):
+    def draw_dashboard(self, frame, x, y, w, h, instant_emo, instant_conf, smooth_emo, smooth_conf, 
+                      instant_civitas_info=None, smooth_civitas_info=None):
         # --- LOGIKA WARNA (UPDATED) ---
         white = (255, 255, 255)
         orange = (0, 165, 255) # BGR
@@ -258,6 +328,7 @@ class LiveSystem:
         red = (0, 0, 255)
         blue = (255, 0, 0)
         gold = (0, 215, 255)  # Gold color
+        gray = (128, 128, 128)
         
         if smooth_emo in ["Neutral", "Happy"]:
             status_color = green
@@ -268,51 +339,71 @@ class LiveSystem:
 
         # --- 1. Info Panel (Diperbesar untuk civitas info) ---
         overlay = frame.copy()
-        panel_w, panel_h = 450, 200
+        panel_w, panel_h = 500, 240
         cv2.rectangle(overlay, (10, 10), (10 + panel_w, 10 + panel_h), (20, 20, 20), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         
         font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.65
+        scale = 0.6
         start_x = 25
-        start_y = 45
-        spacing = 30
+        start_y = 40
+        spacing = 28
 
-        # Baris 1: Instant
+        # Baris 1: Instant Emotion
         cv2.putText(frame, f"Instant: {instant_emo} ({instant_conf:.2f})", 
                     (start_x, start_y), font, scale, white, 1, cv2.LINE_AA)
 
-        # Baris 2: Smoothed
+        # Baris 2: Smoothed Emotion
         cv2.putText(frame, f"Smoothed: {smooth_emo} ({smooth_conf:.2f})", 
                     (start_x, start_y + spacing), font, scale, status_color, 2, cv2.LINE_AA)
 
-        # Baris 3: Civitas Status
-        if civitas_info:
-            civitas_status, civitas_conf = civitas_info
-            civitas_color = gold if civitas_status == "Civitas UB" else white
-            cv2.putText(frame, f"Status: {civitas_status} ({civitas_conf:.2f})", 
-                        (start_x, start_y + spacing * 2), font, scale, civitas_color, 2, cv2.LINE_AA)
+        # Baris 3: Instant Civitas Status
+        if instant_civitas_info:
+            civitas_status, civitas_conf = instant_civitas_info
+            civitas_color = gold if civitas_status == "Civitas UB" else gray
+            cv2.putText(frame, f"Instant Civitas: {civitas_status} ({civitas_conf:.2f})", 
+                        (start_x, start_y + spacing * 2), font, scale, civitas_color, 1, cv2.LINE_AA)
         else:
-            cv2.putText(frame, "Status: Detecting...", 
+            cv2.putText(frame, "Instant Civitas: Detecting...", 
                         (start_x, start_y + spacing * 2), font, scale, white, 1, cv2.LINE_AA)
+        
+        # Baris 4: Smoothed Civitas Status
+        if smooth_civitas_info:
+            smooth_civitas_status, smooth_civitas_conf = smooth_civitas_info
+            if smooth_civitas_status == "Civitas UB":
+                smooth_civitas_color = gold
+            elif smooth_civitas_status == "Uncertain":
+                smooth_civitas_color = orange
+            else:
+                smooth_civitas_color = gray
+            cv2.putText(frame, f"Smoothed Civitas: {smooth_civitas_status} ({smooth_civitas_conf:.2f})", 
+                        (start_x, start_y + spacing * 3), font, scale, smooth_civitas_color, 2, cv2.LINE_AA)
+        else:
+            cv2.putText(frame, "Smoothed Civitas: Collecting...", 
+                        (start_x, start_y + spacing * 3), font, scale, white, 1, cv2.LINE_AA)
 
-        # Baris 4: Buffer Capacity
+        # Baris 5: Buffer Capacity
         buffer_len = len(self.temporal_avg.buffer)
         buffer_pct = int((buffer_len / Config.WINDOW_SIZE) * 100)
-        cv2.putText(frame, f"Buffer: {buffer_len}/{Config.WINDOW_SIZE} ({buffer_pct}%)", 
-                    (start_x, start_y + spacing * 3), font, scale, white, 1, cv2.LINE_AA)
-
-        # Baris 5: FPS Counter
-        cv2.putText(frame, f"FPS: {self.fps:.1f}", 
+        civitas_buffer_len = len(self.civitas_temporal_avg.buffer)
+        cv2.putText(frame, f"Emotion Buffer: {buffer_len}/{Config.WINDOW_SIZE} ({buffer_pct}%)", 
                     (start_x, start_y + spacing * 4), font, scale, white, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"Civitas Buffer: {civitas_buffer_len}/20", 
+                    (start_x, start_y + spacing * 5), font, scale, white, 1, cv2.LINE_AA)
+
+        # Baris 6: FPS Counter
+        cv2.putText(frame, f"FPS: {self.fps:.1f}", 
+                    (start_x, start_y + spacing * 6), font, scale, white, 1, cv2.LINE_AA)
 
         # --- 2. Face Box & Label ---
         cv2.rectangle(frame, (x, y), (x+w, y+h), status_color, 2)
         
-        # Label di atas kepala
+        # Label di atas kepala (gunakan smoothed civitas)
         label_text = f"{smooth_emo}"
-        if civitas_info and civitas_info[0] == "Civitas UB":
+        if smooth_civitas_info and smooth_civitas_info[0] == "Civitas UB":
             label_text += " | UB"
+        elif smooth_civitas_info and smooth_civitas_info[0] == "Uncertain":
+            label_text += " | ?"
         
         (tw, th), _ = cv2.getTextSize(label_text, font, 0.7, 2)
         cv2.rectangle(frame, (x, y - 35), (x + tw + 10, y), status_color, -1)
@@ -373,18 +464,46 @@ class LiveSystem:
                     self.temporal_avg.add_prediction(probs)
                     smooth_emo, smooth_conf = self.temporal_avg.get_averaged_emotion()
                     
-                    # 5. Deteksi status civitas
-                    civitas_status, civitas_conf, civitas_box = self.civitas_detector.detect_civitas_status(frame, x, y, w, h)
+                    # 5. Deteksi status civitas (instant)
+                    instant_civitas_status, instant_civitas_conf, civitas_box, logo_box = self.civitas_detector.detect_civitas_status(frame, x, y, w, h)
                     
-                    # 6. Gambar civitas detection box (opsional)
+                    # 6. Update civitas temporal averaging
+                    is_civitas = instant_civitas_status == "Civitas UB"
+                    self.civitas_temporal_avg.add_prediction(instant_civitas_conf, is_civitas)
+                    smooth_civitas_status, smooth_civitas_conf = self.civitas_temporal_avg.get_averaged_civitas()
+                    
+                    # 7. Gambar civitas detection box
                     if civitas_box:
                         cx, cy, cw, ch = civitas_box
-                        civitas_color = (0, 215, 255) if civitas_status == "Civitas UB" else (128, 128, 128)
+                        civitas_color = (0, 215, 255) if smooth_civitas_status == "Civitas UB" else (128, 128, 128)
                         cv2.rectangle(frame, (cx, cy), (cx+cw, cy+ch), civitas_color, 1)
+                        cv2.putText(frame, "Chest Area", (cx, cy-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, civitas_color, 1)
                     
-                    # 7. Gambar dashboard dengan info civitas
+                    # 8. Gambar logo UB detection box
+                    if logo_box and civitas_box:
+                        cx, cy, cw, ch = civitas_box
+                        lx, ly, lw, lh = logo_box
+                        # Konversi koordinat logo dari chest_roi ke frame koordinat
+                        logo_x = cx + lx
+                        logo_y = cy + ly
+                        
+                        # Warna box berdasarkan confidence
+                        if instant_civitas_conf > 0.7:
+                            logo_color = (0, 255, 0)  # Hijau - confidence tinggi
+                        elif instant_civitas_conf > 0.5:
+                            logo_color = (0, 215, 255)  # Gold - confidence sedang
+                        else:
+                            logo_color = (0, 165, 255)  # Orange - confidence rendah
+                        
+                        cv2.rectangle(frame, (logo_x, logo_y), (logo_x+lw, logo_y+lh), logo_color, 2)
+                        cv2.putText(frame, f"UB Logo ({instant_civitas_conf:.2f})", 
+                                   (logo_x, logo_y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, logo_color, 1)
+                    
+                    # 9. Gambar dashboard dengan info civitas realtime
                     frame = self.draw_dashboard(frame, x, y, w, h, instant_emo, instant_conf, 
-                                              smooth_emo, smooth_conf, (civitas_status, civitas_conf))
+                                              smooth_emo, smooth_conf, 
+                                              (instant_civitas_status, instant_civitas_conf),
+                                              (smooth_civitas_status, smooth_civitas_conf))
                     
                 except Exception as e:
                     print(f"Error: {e}")
@@ -392,6 +511,7 @@ class LiveSystem:
                 self.no_face_counter += 1
                 if self.no_face_counter > 10: 
                     self.temporal_avg.reset()
+                    self.civitas_temporal_avg.reset()
                 
                 # Tetap tampilkan FPS saat idle
                 cv2.putText(frame, f"FPS: {self.fps:.1f}", (25, 150), 
