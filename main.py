@@ -30,9 +30,10 @@ class Config:
         'bw': 'templates/ub_logo_bw.png'
     }
     UB_COLORS = {
-        'navy': ([110, 80, 30], [125, 255, 180]),     # Navy blue (lebih ketat)
-        'gold': ([18, 120, 120], [22, 255, 255]),     # Gold/yellow (lebih spesifik)
-        'dark_blue': ([105, 100, 50], [115, 255, 150])  # Dark blue almamater
+        'navy': ([100, 100, 50], [120, 255, 200]),     # Navy blue almamater UB (lebih spesifik)
+        'gold': ([10, 100, 100], [30, 255, 255]),      # Gold/yellow logo UB
+        'dark_navy': ([105, 120, 30], [115, 255, 150]), # Dark navy almamater
+        'light_navy': ([95, 80, 80], [125, 255, 220])   # Light navy untuk variasi pencahayaan
     }
     
     # Settings UI & Logika
@@ -89,7 +90,7 @@ class TemporalAveraging:
 
 
 class CivitasTemporalAveraging:
-    def __init__(self, window_size=20, confidence_threshold=0.6):
+    def __init__(self, window_size=20, confidence_threshold=0.6):  # Threshold dinaikkan
         self.window_size = window_size
         self.confidence_threshold = confidence_threshold
         self.buffer = deque(maxlen=window_size)
@@ -109,10 +110,10 @@ class CivitasTemporalAveraging:
         avg_score = np.mean(scores)
         avg_status = np.mean(statuses)  # 0.0-1.0
         
-        # Tentukan status berdasarkan rata-rata
-        if avg_status >= 0.6 and avg_score >= self.confidence_threshold:
+        # Tentukan status berdasarkan rata-rata (DIPERKETAT)
+        if avg_status >= 0.6 and avg_score >= self.confidence_threshold:  # 60% frame positif
             return "Civitas UB", avg_score
-        elif avg_status >= 0.4:
+        elif avg_status >= 0.4:  # 40% frame positif
             return "Uncertain", avg_score
         else:
             return "Non-Civitas UB", avg_score
@@ -144,7 +145,7 @@ class CivitasDetector:
         logo_score = 0.0
         logo_location = None
         
-        # 1. Multiple template matching
+        # 1. Template matching dengan threshold ketat
         if self.ub_logo_templates:
             max_template_score = 0.0
             best_location = None
@@ -155,14 +156,14 @@ class CivitasDetector:
                 
                 if max_val > max_template_score:
                     max_template_score = max_val
-                    # Koordinat logo dalam chest_roi
                     best_location = (max_loc[0], max_loc[1], template.shape[1], template.shape[0])
             
-            logo_score += max_template_score * 0.6  # 60% weight untuk template matching
-            if max_template_score > 0.4:  # Threshold untuk lokasi logo
+            # Template matching threshold lebih rendah untuk area besar
+            if max_template_score > 0.6:  # Threshold lebih rendah (dari 0.7)
+                logo_score += max_template_score * 0.8  # Weight tinggi
                 logo_location = best_location
         
-        # 2. Deteksi kombinasi warna navy + gold (untuk logo berwarna)
+        # 2. Deteksi kombinasi warna UB (navy + gold)
         navy_lower, navy_upper = Config.UB_COLORS['navy']
         gold_lower, gold_upper = Config.UB_COLORS['gold']
         
@@ -172,34 +173,69 @@ class CivitasDetector:
         navy_ratio = np.sum(navy_mask > 0) / (chest_roi.shape[0] * chest_roi.shape[1])
         gold_ratio = np.sum(gold_mask > 0) / (chest_roi.shape[0] * chest_roi.shape[1])
         
-        # Kombinasi navy + gold menandakan logo UB berwarna
+        # kombinasi navy + gold untuk logo UB 
         color_score = 0.0
-        if navy_ratio > 0.05 and gold_ratio > 0.02:
-            color_score = min(navy_ratio * 2 + gold_ratio * 3, 0.4)
+        if navy_ratio > 0.04 and gold_ratio > 0.02: 
+            # Cek apakah warna navy dan gold berdekatan (karakteristik logo UB)
+            combined_mask = cv2.bitwise_or(navy_mask, gold_mask)
+            contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                # Cari contour terbesar yang mungkin logo
+                largest_contour = max(contours, key=cv2.contourArea)
+                area = cv2.contourArea(largest_contour)
+                
+                if area > 150:  
+                    x, y, w, h = cv2.boundingRect(largest_contour)
+                    aspect_ratio = w / h
+                    
+                    if 0.7 <= aspect_ratio <= 1.4:
+                        color_score = min(navy_ratio * 4 + gold_ratio * 5, 0.6)  # Weight lebih tinggi
+                        if logo_location is None:
+                            logo_location = (x, y, w, h)
         
         logo_score += color_score
         
-        # 3. Deteksi pola geometris (lingkaran/emblem)
+        # 3. Deteksi pola geometris khusus UB (lingkaran dengan teks)
         circles = cv2.HoughCircles(gray_chest, cv2.HOUGH_GRADIENT, 1, 30,
-                                 param1=50, param2=30, minRadius=10, maxRadius=40)
+                                 param1=50, param2=30, minRadius=15, maxRadius=50)
         
         if circles is not None and len(circles[0]) > 0:
-            logo_score += 0.2
-            # Jika belum ada lokasi dari template matching, gunakan circle detection
-            if logo_location is None and logo_score > 0.45:
-                circle = circles[0][0]
+            for circle in circles[0]:
                 cx, cy, radius = int(circle[0]), int(circle[1]), int(circle[2])
-                logo_location = (cx - radius, cy - radius, radius * 2, radius * 2)
+                
+                mask = np.zeros(gray_chest.shape, dtype=np.uint8)
+                cv2.circle(mask, (cx, cy), radius, 255, -1)
+                
+                masked_hsv = cv2.bitwise_and(hsv_chest, hsv_chest, mask=mask)
+                circle_navy = cv2.inRange(masked_hsv, np.array(navy_lower), np.array(navy_upper))
+                circle_gold = cv2.inRange(masked_hsv, np.array(gold_lower), np.array(gold_upper))
+                
+                circle_navy_ratio = np.sum(circle_navy > 0) / (np.pi * radius * radius)
+                circle_gold_ratio = np.sum(circle_gold > 0) / (np.pi * radius * radius)
+                
+                if circle_navy_ratio > 0.05 and circle_gold_ratio > 0.02:  # Threshold lebih rendah
+                    logo_score += 0.4  
+                    if logo_location is None:
+                        lx = max(0, cx - radius)
+                        ly = max(0, cy - radius)
+                        lw = min(radius * 2, chest_roi.shape[1] - lx)
+                        lh = min(radius * 2, chest_roi.shape[0] - ly)
+                        logo_location = (lx, ly, lw, lh)
+                    break
         
-        return logo_score > 0.45, logo_score, logo_location  # Threshold lebih ketat
+        # Threshold untuk area besar
+        is_ub_logo = (logo_score > 0.4) or (max_template_score > 0.6 if 'max_template_score' in locals() else False)
+        
+        return is_ub_logo, logo_score, logo_location  
     
     def detect_civitas_status(self, frame, x, y, w, h):
         """Deteksi status civitas berdasarkan almamater/jas + logo UB"""
-        # Area dada untuk deteksi jas dan logo
-        chest_y = y + int(h * 0.7)
-        chest_h = int(h * 1.8)
-        chest_x = max(0, x - int(w * 0.4))
-        chest_w = int(w * 1.8)
+        # Area dada untuk deteksi jas dan logo 
+        chest_y = y + int(h * 0.6)
+        chest_h = int(h * 2.2)    
+        chest_x = max(0, x - int(w * 0.6)) 
+        chest_w = int(w * 2.2)     
         
         # Boundary check
         chest_y = min(chest_y, frame.shape[0] - chest_h)
@@ -221,43 +257,45 @@ class CivitasDetector:
         # 2. Deteksi logo UB
         has_logo, logo_confidence, logo_location = self.detect_ub_logo(chest_roi)
         
-        # 3. Deteksi warna almamater tambahan
-        dark_blue_lower, dark_blue_upper = Config.UB_COLORS['dark_blue']
-        dark_blue_mask = cv2.inRange(hsv, np.array(dark_blue_lower), np.array(dark_blue_upper))
-        dark_blue_ratio = np.sum(dark_blue_mask > 0) / (chest_roi.shape[0] * chest_roi.shape[1])
+        # 3. Deteksi warna almamater navy UB (fokus biru navy)
+        dark_navy_lower, dark_navy_upper = Config.UB_COLORS['dark_navy']
+        dark_navy_mask = cv2.inRange(hsv, np.array(dark_navy_lower), np.array(dark_navy_upper))
+        dark_navy_ratio = np.sum(dark_navy_mask > 0) / (chest_roi.shape[0] * chest_roi.shape[1])
         
-        # Gabungan semua warna formal UB
-        formal_ratio = max(navy_ratio, dark_blue_ratio)
+        # Deteksi light navy untuk variasi pencahayaan
+        light_navy_lower, light_navy_upper = Config.UB_COLORS['light_navy']
+        light_navy_mask = cv2.inRange(hsv, np.array(light_navy_lower), np.array(light_navy_upper))
+        light_navy_ratio = np.sum(light_navy_mask > 0) / (chest_roi.shape[0] * chest_roi.shape[1])
         
-        # 4. Logika klasifikasi civitas (DIPERBAIKI)
+        # Gabungan semua variasi navy (almamater UB)
+        navy_total_ratio = max(navy_ratio, dark_navy_ratio, light_navy_ratio)
+        
+        # 4. Logika klasifikasi civitas (FOKUS NAVY + LOGO)
         civitas_score = 0.0
         
-        # CIVITAS UB - Kondisi ketat
-        if formal_ratio > 0.25 and has_logo and logo_confidence > 0.6:
-            # Almamater + Logo UB dengan confidence tinggi
+        # CIVITAS UB - Navy almamater + Logo UB
+        if has_logo and logo_confidence > 0.5 and navy_total_ratio > 0.25:
+            # Logo UB jelas + Navy almamater kuat
             civitas_score = 0.85 + (logo_confidence * 0.15)
             status = "Civitas UB"
-        elif formal_ratio > 0.30 and has_logo and logo_confidence > 0.4:
-            # Almamater kuat + Logo UB sedang
+        elif has_logo and logo_confidence > 0.6 and navy_total_ratio > 0.15:
+            # Logo UB sangat jelas + Navy almamater sedang
             civitas_score = 0.75 + (logo_confidence * 0.15)
             status = "Civitas UB"
         elif has_logo and logo_confidence > 0.7:
-            # Logo UB sangat jelas tanpa almamater (kemungkinan dosen/staff)
-            civitas_score = 0.65
+            # Logo UB sangat jelas (dosen/staff tanpa almamater)
+            civitas_score = 0.70
             status = "Civitas UB"
         
         # NON-CIVITAS UB
-        elif formal_ratio > 0.35:
-            # Pakaian formal tapi tidak ada logo UB (kemungkinan jas biasa)
-            civitas_score = 0.4
-            status = "Non-Civitas UB"
-        elif formal_ratio > 0.20:
-            # Sedikit warna formal
-            civitas_score = 0.25
-            status = "Non-Civitas UB"
         else:
-            # Pakaian casual
-            civitas_score = 0.1
+            # Tanpa logo UB yang jelas = Non-Civitas
+            if navy_total_ratio > 0.30:
+                civitas_score = 0.35  # Navy tapi bukan UB (mungkin seragam lain)
+            elif navy_total_ratio > 0.15:
+                civitas_score = 0.25  # Sedikit navy
+            else:
+                civitas_score = 0.10  # Bukan navy
             status = "Non-Civitas UB"
         
         return status, civitas_score, (chest_x, chest_y, chest_w, chest_h), logo_location
@@ -296,7 +334,7 @@ class LiveSystem:
         ])
         
         self.temporal_avg = TemporalAveraging(Config.WINDOW_SIZE, Config.CONFIDENCE_THRESHOLD)
-        self.civitas_temporal_avg = CivitasTemporalAveraging(window_size=20, confidence_threshold=0.65)
+        self.civitas_temporal_avg = CivitasTemporalAveraging(window_size=20, confidence_threshold=0.6)
         self.no_face_counter = 0
         
         # Variabel FPS
@@ -339,7 +377,7 @@ class LiveSystem:
 
         # --- 1. Info Panel (Diperbesar untuk civitas info) ---
         overlay = frame.copy()
-        panel_w, panel_h = 500, 240
+        panel_w, panel_h = 500, 280  # Tinggi diperbesar
         cv2.rectangle(overlay, (10, 10), (10 + panel_w, 10 + panel_h), (20, 20, 20), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         
@@ -382,18 +420,24 @@ class LiveSystem:
             cv2.putText(frame, "Smoothed Civitas: Collecting...", 
                         (start_x, start_y + spacing * 3), font, scale, white, 1, cv2.LINE_AA)
 
-        # Baris 5: Buffer Capacity
+        # Baris 5: Debug Info (Tambahan untuk troubleshooting)
+        if instant_civitas_info:
+            _, civitas_conf = instant_civitas_info
+            cv2.putText(frame, f"Debug - Logo Conf: {civitas_conf:.2f}", 
+                        (start_x, start_y + spacing * 4), font, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+        
+        # Baris 6: Buffer Capacity
         buffer_len = len(self.temporal_avg.buffer)
         buffer_pct = int((buffer_len / Config.WINDOW_SIZE) * 100)
         civitas_buffer_len = len(self.civitas_temporal_avg.buffer)
         cv2.putText(frame, f"Emotion Buffer: {buffer_len}/{Config.WINDOW_SIZE} ({buffer_pct}%)", 
-                    (start_x, start_y + spacing * 4), font, scale, white, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"Civitas Buffer: {civitas_buffer_len}/20", 
                     (start_x, start_y + spacing * 5), font, scale, white, 1, cv2.LINE_AA)
-
-        # Baris 6: FPS Counter
-        cv2.putText(frame, f"FPS: {self.fps:.1f}", 
+        cv2.putText(frame, f"Civitas Buffer: {civitas_buffer_len}/20", 
                     (start_x, start_y + spacing * 6), font, scale, white, 1, cv2.LINE_AA)
+
+        # Baris 7: FPS Counter
+        cv2.putText(frame, f"FPS: {self.fps:.1f}", 
+                    (start_x, start_y + spacing * 7), font, scale, white, 1, cv2.LINE_AA)
 
         # --- 2. Face Box & Label ---
         cv2.rectangle(frame, (x, y), (x+w, y+h), status_color, 2)
@@ -479,25 +523,37 @@ class LiveSystem:
                         cv2.rectangle(frame, (cx, cy), (cx+cw, cy+ch), civitas_color, 1)
                         cv2.putText(frame, "Chest Area", (cx, cy-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, civitas_color, 1)
                     
-                    # 8. Gambar logo UB detection box
+                    # 8. Gambar logo UB detection box (DIPERBAIKI)
                     if logo_box and civitas_box:
                         cx, cy, cw, ch = civitas_box
                         lx, ly, lw, lh = logo_box
+                        
                         # Konversi koordinat logo dari chest_roi ke frame koordinat
                         logo_x = cx + lx
                         logo_y = cy + ly
                         
-                        # Warna box berdasarkan confidence
-                        if instant_civitas_conf > 0.7:
-                            logo_color = (0, 255, 0)  # Hijau - confidence tinggi
-                        elif instant_civitas_conf > 0.5:
-                            logo_color = (0, 215, 255)  # Gold - confidence sedang
-                        else:
-                            logo_color = (0, 165, 255)  # Orange - confidence rendah
+                        # Boundary checking untuk memastikan box tidak keluar frame
+                        logo_x = max(0, min(logo_x, frame.shape[1] - lw))
+                        logo_y = max(0, min(logo_y, frame.shape[0] - lh))
+                        logo_w = min(lw, frame.shape[1] - logo_x)
+                        logo_h = min(lh, frame.shape[0] - logo_y)
                         
-                        cv2.rectangle(frame, (logo_x, logo_y), (logo_x+lw, logo_y+lh), logo_color, 2)
-                        cv2.putText(frame, f"UB Logo ({instant_civitas_conf:.2f})", 
-                                   (logo_x, logo_y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, logo_color, 1)
+                        # Pastikan ukuran box valid
+                        if logo_w > 0 and logo_h > 0:
+                            # Warna box berdasarkan confidence
+                            if instant_civitas_conf > 0.7:
+                                logo_color = (0, 255, 0)  # Hijau - confidence tinggi
+                            elif instant_civitas_conf > 0.5:
+                                logo_color = (0, 215, 255)  # Gold - confidence sedang
+                            else:
+                                logo_color = (0, 165, 255)  # Orange - confidence rendah
+                            
+                            cv2.rectangle(frame, (logo_x, logo_y), (logo_x+logo_w, logo_y+logo_h), logo_color, 2)
+                            
+                            # Label dengan posisi yang aman
+                            label_y = max(logo_y - 5, 15)
+                            cv2.putText(frame, f"UB Logo ({instant_civitas_conf:.2f})", 
+                                       (logo_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, logo_color, 1)
                     
                     # 9. Gambar dashboard dengan info civitas realtime
                     frame = self.draw_dashboard(frame, x, y, w, h, instant_emo, instant_conf, 
