@@ -5,7 +5,8 @@ import os
 
 # ==================== CONFIG ====================
 # Path model .pth yang sudah jadi
-INPUT_MODEL_PATH = 'models/fer_model_v1.2_fusion.pth' 
+INPUT_MODEL_PATH = 'models/fer_model_v1.2_fusion_colab.pth' 
+
 # Output nama file onnx
 OUTPUT_ONNX_PATH = 'fer_resnet34_v1.2.onnx'
 
